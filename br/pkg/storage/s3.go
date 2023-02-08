@@ -638,16 +638,19 @@ func (rs *S3Storage) URI() string {
 
 // Open a Reader by file path.
 func (rs *S3Storage) Open(ctx context.Context, path string) (ExternalFileReader, error) {
-	reader, r, err := rs.open(ctx, path, 0, 0)
+	objSize, err := rs.getObjectSize(ctx, path)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.Annotate(err, "get object size failed")
 	}
 	return &s3ObjectReader{
-		storage:   rs,
-		name:      path,
-		reader:    reader,
-		ctx:       ctx,
-		rangeInfo: r,
+		storage: rs,
+		name:    path,
+		ctx:     ctx,
+		rangeInfo: RangeInfo{
+			Start: 0,
+			End:   0,
+			Size:  objSize,
+		},
 	}, nil
 }
 
@@ -663,6 +666,22 @@ type RangeInfo struct {
 	End int64
 	// Size is the total size of the original file.
 	Size int64
+}
+
+func (rs *S3Storage) getObjectSize(ctx context.Context, path string) (int64, error) {
+	input := &s3.HeadObjectInput{
+		Bucket: aws.String(rs.options.Bucket),
+		Key:    aws.String(rs.options.Prefix + path),
+	}
+	result, err := rs.svc.HeadObjectWithContext(ctx, input)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	if result.ContentLength == nil {
+		return 0, errors.Annotatef(berrors.ErrStorageUnknown, "get object info '%s' failed. The S3 object has no content length", path)
+	}
+	return *(result.ContentLength), nil
 }
 
 // if endOffset > startOffset, should return reader for bytes in [startOffset, endOffset).
@@ -775,8 +794,39 @@ type s3ObjectReader struct {
 	retryCnt int
 }
 
+func (r *s3ObjectReader) openRequestRange() error {
+	newReader, realRangeInfo, err := r.storage.open(r.ctx, r.name, r.rangeInfo.Start, r.rangeInfo.End)
+	if err != nil {
+		return err
+	}
+	r.reader = newReader
+	r.rangeInfo = realRangeInfo
+	r.pos = realRangeInfo.Start
+	return nil
+}
+
+func (r *s3ObjectReader) changeRequestRange(startOffset int64, endOffset int64) error {
+	if r.reader != nil {
+		// close current read and open a new one which target offset
+		err := r.reader.Close()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	r.reader = nil
+
+	r.rangeInfo.Start = startOffset
+	r.rangeInfo.End = endOffset
+	return nil
+}
+
 // Read implement the io.Reader interface.
 func (r *s3ObjectReader) Read(p []byte) (n int, err error) {
+	if r.reader == nil {
+		if err := r.openRequestRange(); err != nil {
+			return 0, errors.Trace(err)
+		}
+	}
 	maxCnt := r.rangeInfo.End + 1 - r.pos
 	if maxCnt > int64(len(p)) {
 		maxCnt = int64(len(p))
@@ -856,18 +906,9 @@ func (r *s3ObjectReader) Seek(offset int64, whence int) (int64, error) {
 		return realOffset, nil
 	}
 
-	// close current read and open a new one which target offset
-	err := r.reader.Close()
-	if err != nil {
+	if err := r.changeRequestRange(realOffset, 0); err != nil {
 		return 0, errors.Trace(err)
 	}
-
-	newReader, info, err := r.storage.open(r.ctx, r.name, realOffset, 0)
-	if err != nil {
-		return 0, errors.Trace(err)
-	}
-	r.reader = newReader
-	r.rangeInfo = info
 	r.pos = realOffset
 	return realOffset, nil
 }
